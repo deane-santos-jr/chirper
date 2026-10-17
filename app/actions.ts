@@ -77,6 +77,8 @@ export async function toggleDebtPaid(debtId: number, syncWallet: boolean): Promi
   const debt = db.getDebtSchedule(debtId);
   if (!debt) return;
   const paid = !debt.paidThisMonth;
+  // The wallet moves only by an installment that actually changed: a finished loan, or one with
+  // nothing paid yet (e.g. a fresh loan flagged as "not due this month"), moves no cash.
   const installments = paid ? Math.min(debt.totalInstallments, debt.paidInstallments + 1) : Math.max(0, debt.paidInstallments - 1);
   const walletDelta = syncWallet ? roundPesos((debt.paidInstallments - installments) * debt.monthlyAmount) : 0;
   db.setDebtPaid(debtId, paid, installments, walletDelta);

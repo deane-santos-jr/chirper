@@ -16,8 +16,13 @@ export function CycleControlsCard({ cycleLabel, nextCycleLabel }: { cycleLabel: 
     if (confirmText && !window.confirm(confirmText)) return;
     setRunning(kind);
     startTransition(async () => {
-      setMessage(await task());
-      setRunning(null);
+      try {
+        setMessage(await task());
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : String(error));
+      } finally {
+        setRunning(null);
+      }
     });
   };
 
