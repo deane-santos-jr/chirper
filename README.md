@@ -1,66 +1,48 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Fin Tracker — Local Cash Flow & Debt Runway Engine
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+Forward-looking, chronological running-balance ledger: payroll cutoffs (with absence math), side income, loan installments, and credit-card statement vs. due dates. Shows the wallet balance after every event so a mid-month shortfall is visible weeks ahead.
 
-## About Laravel
+Local-first: Next.js (App Router) + `better-sqlite3`. No auth, no cloud.
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+## Run
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+```bash
+npm install
+npm run dev        # http://localhost:3000
+```
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+`finance.db` (WAL mode) is created at the project root and seeded with the Oct 17, 2026 state on first run.
 
-## Learning Laravel
+| Script | Purpose |
+| --- | --- |
+| `npm test` | Ledger arithmetic tests (Vitest) |
+| `npm run typecheck` | TypeScript |
+| `npm run build` | Production build |
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+## Layout
 
-You may also try the [Laravel Bootcamp](https://bootcamp.laravel.com), where you will be guided through building a modern Laravel application from scratch.
+```
+lib/domain/   Pure business rules (no I/O) — shared by server and client
+  calendar.ts     Timezone-free ISO date math (Asia/Manila "today")
+  money.ts        Integer-centavo arithmetic, ₱ formatting (en-PH)
+  payroll.ts      Net pay = gross − fixed deductions − absences × rate
+  loans.ts        Installment schedule, remaining balance, payoff dates
+  creditCard.ts   Statement day (₱0 info) vs. due day (cash out)
+  ledger.ts       Running-balance engine (cycle month + 2 months)
+  insights.ts     KPIs: safe daily spend, debt service, liberation, spend ceiling
+lib/db.ts     SQLite schema, seed-on-empty, parameterized queries
+lib/seed.ts   Oct 17, 2026 seed data
+app/actions.ts  Server Actions (all mutations → revalidatePath('/'))
+app/page.tsx    Dashboard (server component)
+components/     KPI cards, panels, ledger (client components where interactive)
+```
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+## Rules
 
-## Laravel Sponsors
-
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the [Laravel Partners program](https://partners.laravel.com).
-
-### Premium Partners
-
-- **[Vehikl](https://vehikl.com/)**
-- **[Tighten Co.](https://tighten.co)**
-- **[WebReinvent](https://webreinvent.com/)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel/)**
-- **[Cyber-Duck](https://cyber-duck.co.uk)**
-- **[DevSquad](https://devsquad.com/hire-laravel-developers)**
-- **[Jump24](https://jump24.co.uk)**
-- **[Redberry](https://redberry.international/laravel/)**
-- **[Active Logic](https://activelogic.com)**
-- **[byte5](https://byte5.de)**
-- **[OP.GG](https://op.gg)**
-
-## Contributing
-
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
-
-## Code of Conduct
-
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
-
-## Security Vulnerabilities
-
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
-
-## License
-
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+- **Completed items** (`received_this_month` / `paid_this_month`) are listed as done and never re-applied to the starting wallet balance.
+- **Overdue items**: an unpaid cycle-month item whose date has passed is rolled onto today and flagged.
+- **Absences** deduct only when entered (> 0), in 0.5-day steps, per cutoff (current and next month).
+- **Credit card**: the statement day is an info row; cash leaves on the next due day. The current bill is `statement_balance` (or the projected spend if higher and the statement hasn't cut yet). Later bills use *Next month projected spend*. Paying a statement zeroes it and remembers the amount for undo.
+- **Received/Paid toggles** ask whether to move the wallet balance too, so a manually synced wallet is never double counted.
+- **Start New Month Cycle** clears received/paid flags, keeps installment counts, and moves next-month absences into the current month.
+- **Backup Database** writes an online copy to `./backups/`.

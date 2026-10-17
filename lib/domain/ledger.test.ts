@@ -1,0 +1,182 @@
+import { describe, expect, it } from 'vitest';
+import { parseYearMonthKey } from './calendar';
+import { currentBill } from './creditCard';
+import { debtServiceByMonth, liberationMilestones, maxSafeLivingSpend, nextInflow, nextOutflow, safeSpendUntilPayday, simulateLivingSpend } from './insights';
+import { allEvents, buildLedger } from './ledger';
+import { remainingBalance } from './loans';
+import { netPay } from './payroll';
+import type { CreditCard, DebtSchedule, FinanceSnapshot, IncomeRule } from './types';
+import { SEED_CREDIT_CARDS, SEED_DEBT_SCHEDULES, SEED_INCOME_RULES, SEED_SETTINGS } from '../seed';
+
+const TODAY = '2026-10-17';
+
+function seedSnapshot(): FinanceSnapshot {
+  const incomes: IncomeRule[] = SEED_INCOME_RULES.map((row, index) => ({
+    id: index + 1,
+    name: row.name,
+    dayOfMonth: row.day_of_month,
+    grossAmount: row.gross_amount,
+    fixedDeductions: row.fixed_deductions,
+    isPayroll: row.is_payroll === 1,
+    absenceRate: row.absence_rate,
+    currentAbsences: row.current_absences,
+    nextMonthAbsences: row.next_month_absences,
+    receivedThisMonth: row.received_this_month === 1,
+  }));
+  const debts: DebtSchedule[] = SEED_DEBT_SCHEDULES.map((row, index) => ({
+    id: index + 1,
+    name: row.name,
+    lender: row.lender,
+    dueDay: row.due_day,
+    monthlyAmount: row.monthly_amount,
+    totalInstallments: row.total_installments,
+    paidInstallments: row.paid_installments,
+    paidThisMonth: row.paid_this_month === 1,
+    notes: row.notes,
+  }));
+  const cards: CreditCard[] = SEED_CREDIT_CARDS.map((row, index) => ({
+    id: index + 1,
+    name: row.name,
+    statementDay: row.statement_day,
+    dueDay: row.due_day,
+    unbilledAmount: row.unbilled_amount,
+    statementBalance: row.statement_balance,
+    minimumDue: row.minimum_due,
+    paidThisMonth: row.paid_this_month === 1,
+    projectedMonthlySpend: row.projected_monthly_spend,
+    lastSettledDue: row.last_settled_due,
+    lastPaidAmount: row.last_paid_amount,
+  }));
+  return {
+    settings: {
+      walletBalance: Number(SEED_SETTINGS.wallet_balance),
+      walletName: String(SEED_SETTINGS.wallet_name),
+      currentMonthLabel: String(SEED_SETTINGS.current_month_label),
+      cycleMonth: parseYearMonthKey(String(SEED_SETTINGS.cycle_month)),
+    },
+    incomes,
+    debts,
+    cards,
+    expenses: [],
+  };
+}
+
+const rows = (snapshot: FinanceSnapshot) =>
+  allEvents(buildLedger(snapshot, TODAY)).map((event) => [event.date, event.amount, event.runningBalance]);
+
+describe('payroll', () => {
+  it('nets ₱13,454.00 with zero absences and deducts ₱986.30 per absence day', () => {
+    const payroll = seedSnapshot().incomes[1];
+    expect(netPay(payroll, 0)).toBe(13454);
+    expect(netPay(payroll, 1.5)).toBe(11974.55);
+  });
+});
+
+describe('seeded runway ledger (Oct 17 → Nov 25)', () => {
+  it('matches the expected running balance to the centavo', () => {
+    expect(rows(seedSnapshot()).filter(([date]) => String(date) <= '2026-11-25')).toEqual([
+      ['2026-10-22', 0, 1145.65],
+      ['2026-10-25', 13454, 14599.65],
+      ['2026-11-01', -10579.6, 4020.05],
+      ['2026-11-04', 5000, 9020.05],
+      ['2026-11-10', 13454, 22474.05],
+      ['2026-11-13', -8520.52, 13953.53],
+      ['2026-11-15', 3500, 17453.53],
+      ['2026-11-17', -1100.49, 16353.04],
+      ['2026-11-20', -2977, 13376.04],
+      ['2026-11-22', 0, 13376.04],
+      ['2026-11-22', -10885, 2491.04],
+      ['2026-11-25', 13454, 15945.04],
+    ]);
+  });
+
+  it('ends December after the final ₱30k installment on Dec 22', () => {
+    const december = buildLedger(seedSnapshot(), TODAY).months[2];
+    const final = december.events.find((event) => event.title.startsWith('3-Month Cash Loan'));
+    expect(final?.title).toBe('3-Month Cash Loan (₱30k) (3/3)');
+    expect(final?.date).toBe('2026-12-22');
+    expect(december.events.at(-1)).toMatchObject({ date: '2026-12-25', runningBalance: 27870.03 });
+  });
+
+  it('reports the October items as completed without touching starting cash', () => {
+    const ledger = buildLedger(seedSnapshot(), TODAY);
+    expect(ledger.startingBalance).toBe(1145.65);
+    expect(ledger.completed.map((item) => item.title)).toContain('Installment Loan (₱74.2k)');
+    expect(ledger.completed.filter((item) => item.id.startsWith('debt'))).toHaveLength(4);
+    expect(ledger.bufferNeeded).toBe(0);
+  });
+});
+
+describe('absences', () => {
+  it('only reduce the cutoff they were entered for', () => {
+    const snapshot = seedSnapshot();
+    snapshot.incomes[3].currentAbsences = 1;
+    const oct25 = allEvents(buildLedger(snapshot, TODAY)).find((event) => event.date === '2026-10-25');
+    expect(oct25?.amount).toBe(12467.7);
+    expect(oct25?.runningBalance).toBe(13613.35);
+  });
+});
+
+describe('shortfall detection', () => {
+  it('computes the buffer needed when the balance dips below zero', () => {
+    const snapshot = seedSnapshot();
+    snapshot.settings.walletBalance = 0;
+    snapshot.incomes[3].currentAbsences = 4;
+    const ledger = buildLedger(snapshot, TODAY);
+    // Oct 25: 13,454 − 3,945.20 = 9,508.80; Nov 1: 9,508.80 − 10,579.60 = −1,070.80
+    expect(allEvents(ledger).find((event) => event.date === '2026-11-01')?.runningBalance).toBe(-1070.8);
+    // The deficit carries forward and bottoms out after the Nov 22 installment.
+    expect(ledger.lowestPoint).toEqual({ date: '2026-11-22', balance: -2599.81 });
+    expect(ledger.bufferNeeded).toBe(2599.81);
+  });
+});
+
+describe('credit card two-date logic', () => {
+  it('bills on the 22nd and deducts on the 1st of the following month', () => {
+    const bill = currentBill(seedSnapshot().cards[0], TODAY);
+    expect(bill).toMatchObject({ statementDate: '2026-10-22', dueDate: '2026-11-01', amount: 10579.6 });
+  });
+
+  it('moves to the next statement once the current one is settled', () => {
+    const card = { ...seedSnapshot().cards[0], statementBalance: 0, lastSettledDue: '2026-11-01', projectedMonthlySpend: 2500 };
+    expect(currentBill(card, TODAY)).toMatchObject({ statementDate: '2026-11-22', dueDate: '2026-12-01', amount: 2500 });
+  });
+});
+
+describe('KPIs', () => {
+  const ledger = buildLedger(seedSnapshot(), TODAY);
+
+  it('daily safe spend = wallet ÷ days until the Oct 25 payday', () => {
+    const safe = safeSpendUntilPayday(ledger);
+    expect(safe.payday?.date).toBe('2026-10-25');
+    expect(safe.daysUntilPayday).toBe(8);
+    expect(safe.dailySafeSpend).toBe(143.2);
+  });
+
+  it('finds the next inflow and outflow', () => {
+    expect(nextInflow(ledger)).toMatchObject({ date: '2026-10-25', amount: 13454 });
+    expect(nextOutflow(ledger)).toMatchObject({ date: '2026-11-01', amount: -10579.6 });
+  });
+
+  it('sums ₱23,483.01/mo of loan service in Nov and Dec', () => {
+    expect(debtServiceByMonth(ledger).map((month) => month.total)).toEqual([23483.01, 23483.01]);
+  });
+
+  it('frees ₱10,885/mo after Dec 22 and ₱1,100.49/mo after Jan 17', () => {
+    const [first, second] = liberationMilestones(seedSnapshot().debts, ledger.cycleMonth);
+    expect(first).toMatchObject({ finalPaymentDate: '2026-12-22', installmentsLeft: 2, freedMonthly: 10885, freedFromMonth: { year: 2027, month: 1 } });
+    expect(second).toMatchObject({ finalPaymentDate: '2027-01-17', freedMonthly: 1100.49 });
+  });
+
+  it('reports remaining loan balances', () => {
+    expect(remainingBalance(seedSnapshot().debts[0])).toBe(76684.68);
+  });
+
+  it('caps living spend so Nov 22 never dips below zero', () => {
+    const ceiling = maxSafeLivingSpend(ledger);
+    expect(ceiling.bindingEvent?.date).toBe('2026-11-22');
+    const simulated = simulateLivingSpend(ledger, ceiling.monthlyCeiling);
+    expect(Math.min(...simulated.map((row) => row.simulatedBalance))).toBeGreaterThanOrEqual(0);
+    expect(Math.min(...simulateLivingSpend(ledger, ceiling.monthlyCeiling + 1).map((row) => row.simulatedBalance))).toBeLessThan(0);
+  });
+});
