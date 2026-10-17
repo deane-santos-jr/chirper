@@ -13,9 +13,21 @@ npm run dev        # http://localhost:3000
 
 `finance.db` (WAL mode) is created at the project root and seeded with the Oct 17, 2026 state on first run.
 
+## Fin Agent (talk instead of clicking)
+
+The chat dock (right sidebar on wide screens) is a Claude agent with a tool for every dashboard action. Tell it what happened ("got my 25th payroll, MariBank is now 14,599.65", "paid GLoan", "spent 250 on lunch"), paste or drop a bank/loan screenshot, or dictate with the mic. It updates the data and replies with the new wallet and lowest upcoming balance.
+
+Setup (once):
+
+```bash
+cp .env.example .env.local   # then paste your key from Console → API keys
+```
+
+Restart the app after adding the key. Usage is billed to your Claude Console credits (model `claude-opus-5-5`). Today's conversation is stored in `finance.db`; a new chat starts each day.
+
 | Script | Purpose |
 | --- | --- |
-| `npm test` | Ledger arithmetic tests (Vitest) |
+| `npm test` | Ledger arithmetic + agent tool tests (Vitest) |
 | `npm run typecheck` | TypeScript |
 | `npm run build` | Production build |
 
@@ -30,6 +42,8 @@ lib/domain/   Pure business rules (no I/O) — shared by server and client
   creditCard.ts   Statement day (₱0 info) vs. due day (cash out)
   ledger.ts       Running-balance engine (cycle month + 2 months)
   insights.ts     KPIs: safe daily spend, debt service, liberation, spend ceiling
+lib/commands.ts Use cases shared by the dashboard and the agent (validation + summaries)
+lib/agent/    Claude agent: system prompt + tool loop, tools, state report, transcript view
 lib/db.ts     SQLite schema, seed-on-empty, parameterized queries
 lib/seed.ts   Oct 17, 2026 seed data
 app/actions.ts  Server Actions (all mutations → revalidatePath('/'))
