@@ -1,168 +1,147 @@
 'use server';
 
+import Anthropic from '@anthropic-ai/sdk';
 import { revalidatePath } from 'next/cache';
-import { firstDayOf, maxDate, todayLocal, type IsoDate } from '@/lib/domain/calendar';
-import { currentBill } from '@/lib/domain/creditCard';
+import { AgentUnavailableError, runAgentTurn } from '@/lib/agent/agent';
+import type { AgentImage } from '@/lib/agent/types';
 import { roundPesos } from '@/lib/domain/money';
-import { netPay, normalizeAbsences } from '@/lib/domain/payroll';
-import * as db from '@/lib/db';
+import * as commands from '@/lib/commands';
 
-/* ─────────────────────────── input parsing ─────────────────────────── */
+/* Thin FormData/argument adapters over lib/commands; every mutation refreshes the dashboard. */
 
 function text(form: FormData, key: string): string {
   return String(form.get(key) ?? '').trim();
 }
 
-function requiredText(form: FormData, key: string): string {
-  const value = text(form, key);
-  if (!value) throw new Error(`"${key}" is required.`);
-  return value;
-}
-
 function pesos(form: FormData, key: string): number {
-  const value = Number(text(form, key).replace(/[₱,\s]/g, ''));
-  if (!Number.isFinite(value)) throw new Error(`"${key}" must be a peso amount.`);
-  return roundPesos(value);
+  return roundPesos(Number(text(form, key).replace(/[₱,\s]/g, '')));
 }
 
-function nonNegativePesos(form: FormData, key: string): number {
-  const value = pesos(form, key);
-  if (value < 0) throw new Error(`"${key}" cannot be negative.`);
-  return value;
-}
-
-function integerInRange(form: FormData, key: string, min: number, max: number): number {
-  const value = Number(text(form, key));
-  if (!Number.isInteger(value) || value < min || value > max) throw new Error(`"${key}" must be a whole number from ${min} to ${max}.`);
-  return value;
+function integer(form: FormData, key: string): number {
+  return Number(text(form, key));
 }
 
 function refresh(): void {
   revalidatePath('/');
 }
 
-function ledgerStart(): IsoDate {
-  return maxDate(todayLocal(), firstDayOf(db.getSnapshot().settings.cycleMonth));
-}
-
 /* ─────────────────────────────── wallet ────────────────────────────── */
 
 export async function syncWalletBalance(form: FormData): Promise<void> {
-  db.setWalletBalance(pesos(form, 'balance'));
+  commands.setWalletBalance(pesos(form, 'balance'));
   refresh();
 }
 
 /* ─────────────────────────────── income ────────────────────────────── */
 
 export async function stepAbsences(incomeId: number, period: 'current' | 'next', delta: number): Promise<void> {
-  const rule = db.getIncomeRule(incomeId);
-  if (!rule?.isPayroll) return;
-  const current = period === 'current' ? rule.currentAbsences : rule.nextMonthAbsences;
-  db.setAbsences(incomeId, period, normalizeAbsences(current + delta));
+  commands.stepAbsences(incomeId, period, delta);
   refresh();
 }
 
 export async function toggleIncomeReceived(incomeId: number, syncWallet: boolean): Promise<void> {
-  const rule = db.getIncomeRule(incomeId);
-  if (!rule) return;
-  const received = !rule.receivedThisMonth;
-  const amount = netPay(rule, rule.currentAbsences);
-  db.setIncomeReceived(incomeId, received, syncWallet ? (received ? amount : -amount) : 0);
+  commands.toggleIncomeReceived(incomeId, syncWallet);
   refresh();
 }
 
 /* ─────────────────────────────── loans ─────────────────────────────── */
 
 export async function toggleDebtPaid(debtId: number, syncWallet: boolean): Promise<void> {
-  const debt = db.getDebtSchedule(debtId);
-  if (!debt) return;
-  const paid = !debt.paidThisMonth;
-  // The wallet moves only by an installment that actually changed: a finished loan, or one with
-  // nothing paid yet (e.g. a fresh loan flagged as "not due this month"), moves no cash.
-  const installments = paid ? Math.min(debt.totalInstallments, debt.paidInstallments + 1) : Math.max(0, debt.paidInstallments - 1);
-  const walletDelta = syncWallet ? roundPesos((debt.paidInstallments - installments) * debt.monthlyAmount) : 0;
-  db.setDebtPaid(debtId, paid, installments, walletDelta);
+  commands.toggleLoanPaid(debtId, syncWallet);
   refresh();
 }
 
-function debtInput(form: FormData): db.DebtInput {
-  const totalInstallments = integerInRange(form, 'totalInstallments', 1, 600);
-  const monthlyAmount = nonNegativePesos(form, 'monthlyAmount');
-  if (monthlyAmount === 0) throw new Error('"monthlyAmount" must be greater than zero.');
-  return {
-    name: requiredText(form, 'name'),
+export async function saveDebt(form: FormData): Promise<void> {
+  const id = integer(form, 'id');
+  const input = {
+    name: text(form, 'name'),
     lender: text(form, 'lender'),
-    dueDay: integerInRange(form, 'dueDay', 1, 31),
-    monthlyAmount,
-    totalInstallments,
-    paidInstallments: integerInRange(form, 'paidInstallments', 0, totalInstallments),
+    dueDay: integer(form, 'dueDay'),
+    monthlyAmount: pesos(form, 'monthlyAmount'),
+    totalInstallments: integer(form, 'totalInstallments'),
+    paidInstallments: integer(form, 'paidInstallments'),
     notes: text(form, 'notes'),
   };
-}
-
-export async function saveDebt(form: FormData): Promise<void> {
-  const id = Number(text(form, 'id'));
-  if (id > 0) db.updateDebt(id, debtInput(form));
-  else db.insertDebt(debtInput(form));
+  if (id > 0) commands.updateLoan(id, input);
+  else commands.addLoan(input);
   refresh();
 }
 
 export async function removeDebt(debtId: number): Promise<void> {
-  db.deleteDebt(debtId);
+  commands.deleteLoan(debtId);
   refresh();
 }
 
 /* ──────────────────────────── credit cards ─────────────────────────── */
 
 export async function saveCard(form: FormData): Promise<void> {
-  db.updateCard(integerInRange(form, 'id', 1, Number.MAX_SAFE_INTEGER), {
-    statementBalance: nonNegativePesos(form, 'statementBalance'),
-    unbilledAmount: nonNegativePesos(form, 'unbilledAmount'),
-    minimumDue: nonNegativePesos(form, 'minimumDue'),
-    projectedMonthlySpend: nonNegativePesos(form, 'projectedMonthlySpend'),
+  commands.updateCard(integer(form, 'id'), {
+    statementBalance: pesos(form, 'statementBalance'),
+    unbilledAmount: pesos(form, 'unbilledAmount'),
+    minimumDue: pesos(form, 'minimumDue'),
+    projectedMonthlySpend: pesos(form, 'projectedMonthlySpend'),
   });
   refresh();
 }
 
 export async function toggleCardPaid(cardId: number, syncWallet: boolean): Promise<void> {
-  const card = db.getCreditCard(cardId);
-  if (!card) return;
-  if (card.paidThisMonth) {
-    db.undoCardSettlement(cardId, syncWallet ? card.lastPaidAmount : 0);
-  } else {
-    const bill = currentBill(card, ledgerStart());
-    if (!bill) return;
-    db.settleCardStatement(cardId, bill.dueDate, bill.amount, syncWallet ? -bill.amount : 0);
-  }
+  commands.toggleCardStatementPaid(cardId, syncWallet);
   refresh();
 }
 
 /* ─────────────────────────── quick expenses ────────────────────────── */
 
 export async function logQuickExpense(form: FormData): Promise<void> {
-  const amount = nonNegativePesos(form, 'amount');
-  if (amount === 0) throw new Error('"amount" must be greater than zero.');
-  db.addQuickExpense(requiredText(form, 'description'), amount, todayLocal());
+  commands.logExpense(text(form, 'description'), pesos(form, 'amount'));
   refresh();
 }
 
 export async function removeQuickExpense(expenseId: number): Promise<void> {
-  db.deleteQuickExpense(expenseId);
+  commands.deleteExpense(expenseId);
   refresh();
 }
 
 /* ──────────────────────────── cycle control ────────────────────────── */
 
 export async function startNewMonthCycle(): Promise<void> {
-  db.startNewMonthCycle();
+  commands.startNewMonthCycle();
   refresh();
 }
 
 export async function resetToSeed(): Promise<void> {
-  db.resetToSeed();
+  commands.resetToSeed();
   refresh();
 }
 
 export async function backupDatabase(): Promise<string> {
-  return db.backupDatabase();
+  return commands.backupDatabase();
+}
+
+/* ──────────────────────────────── agent ────────────────────────────── */
+
+export interface AgentReplyResult {
+  error?: string;
+}
+
+function agentErrorMessage(error: unknown): string {
+  if (error instanceof AgentUnavailableError) return error.message;
+  if (error instanceof Anthropic.AuthenticationError) return 'The API key was rejected. Check ANTHROPIC_API_KEY in .env.local.';
+  if (error instanceof Anthropic.PermissionDeniedError) return 'This API key has no access to the model. Check your Console workspace.';
+  if (error instanceof Anthropic.RateLimitError) return 'Rate limited by the API. Wait a moment and send again.';
+  if (error instanceof Anthropic.APIConnectionError) return 'Could not reach the Claude API. Check your internet connection.';
+  if (error instanceof Anthropic.APIError) return `Claude API error ${error.status ?? ''}: ${error.message}`;
+  throw error;
+}
+
+export async function askAgent(message: string, images: AgentImage[]): Promise<AgentReplyResult> {
+  const text = message.trim();
+  if (!text && images.length === 0) return {};
+  try {
+    await runAgentTurn(text || 'See the attached screenshot.', images);
+    return {};
+  } catch (error) {
+    return { error: agentErrorMessage(error) };
+  } finally {
+    refresh();
+  }
 }

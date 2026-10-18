@@ -1,0 +1,85 @@
+import 'server-only';
+import { getSnapshot } from '@/lib/db';
+import { formatMonthLabel, yearMonthKey, type IsoDate } from '@/lib/domain/calendar';
+import { currentBill } from '@/lib/domain/creditCard';
+import { debtServiceByMonth, liberationMilestones, safeSpendUntilPayday } from '@/lib/domain/insights';
+import { allEvents, buildLedger } from '@/lib/domain/ledger';
+import { payoffOf, remainingBalance, scheduledInstallments } from '@/lib/domain/loans';
+import { netPay } from '@/lib/domain/payroll';
+
+const LOOKAHEAD_MONTHS = 600;
+const RECENT_EXPENSES = 15;
+
+/** Everything the agent needs to reason about the user's money, with ids for its tools. */
+export function financialState(today: IsoDate) {
+  const snapshot = getSnapshot();
+  const { settings, incomes, debts, cards, expenses } = snapshot;
+  const ledger = buildLedger(snapshot, today);
+  const safeSpend = safeSpendUntilPayday(ledger);
+
+  return {
+    today,
+    cycleMonth: settings.currentMonthLabel,
+    wallet: { name: settings.walletName, balance: settings.walletBalance },
+    incomes: incomes.map((rule) => ({
+      id: rule.id,
+      name: rule.name,
+      dayOfMonth: rule.dayOfMonth,
+      grossAmount: rule.grossAmount,
+      fixedDeductions: rule.fixedDeductions,
+      isPayroll: rule.isPayroll,
+      absenceRate: rule.absenceRate,
+      currentMonthAbsences: rule.currentAbsences,
+      nextMonthAbsences: rule.nextMonthAbsences,
+      netPayThisMonth: netPay(rule, rule.currentAbsences),
+      receivedThisMonth: rule.receivedThisMonth,
+    })),
+    loans: debts.map((debt) => ({
+      id: debt.id,
+      name: debt.name,
+      lender: debt.lender,
+      dueDay: debt.dueDay,
+      monthlyAmount: debt.monthlyAmount,
+      installmentsPaid: `${debt.paidInstallments}/${debt.totalInstallments}`,
+      paidThisMonth: debt.paidThisMonth,
+      remainingBalance: remainingBalance(debt),
+      nextInstallment: scheduledInstallments(debt, settings.cycleMonth, LOOKAHEAD_MONTHS)[0] ?? null,
+      finalPaymentDate: payoffOf(debt, settings.cycleMonth)?.finalPaymentDate ?? null,
+      notes: debt.notes,
+    })),
+    creditCards: cards.map((card) => ({
+      id: card.id,
+      name: card.name,
+      statementDay: card.statementDay,
+      dueDay: card.dueDay,
+      statementBalance: card.statementBalance,
+      unbilledAmount: card.unbilledAmount,
+      minimumDue: card.minimumDue,
+      projectedMonthlySpend: card.projectedMonthlySpend,
+      statementPaidThisCycle: card.paidThisMonth,
+      upcomingBill: currentBill(card, ledger.startDate),
+    })),
+    recentExpenses: expenses.slice(0, RECENT_EXPENSES),
+    runway: {
+      lowestPoint: ledger.lowestPoint,
+      bufferNeededToAvoidShortfall: ledger.bufferNeeded,
+      dailySafeSpendUntilNextPayday: safeSpend.dailySafeSpend,
+      nextPayday: safeSpend.payday?.date ?? null,
+      completedThisCycle: ledger.completed.map(({ date, title, amount, note }) => ({ date, title, amount, note })),
+      upcoming: allEvents(ledger).map((event) => ({
+        date: event.date,
+        title: event.title,
+        amount: event.amount,
+        balanceAfter: event.runningBalance,
+        ...(event.overdue ? { overdueSince: event.scheduledDate } : {}),
+      })),
+    },
+    loanServicePerMonth: debtServiceByMonth(ledger).map((row) => ({ month: formatMonthLabel(row.month), total: row.total })),
+    payoffMilestones: liberationMilestones(debts, settings.cycleMonth).map((milestone) => ({
+      finalPaymentDate: milestone.finalPaymentDate,
+      loans: milestone.loans.map((loan) => loan.name),
+      freedMonthly: milestone.freedMonthly,
+      freedFrom: yearMonthKey(milestone.freedFromMonth),
+    })),
+  };
+}

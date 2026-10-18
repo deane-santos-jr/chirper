@@ -3,7 +3,6 @@
 import { Loader2, RefreshCw, Wallet } from 'lucide-react';
 import { useTransition } from 'react';
 import { syncWalletBalance } from '@/app/actions';
-import { Badge } from '@/components/ui/Badge';
 import { Money } from '@/components/ui/Money';
 import { formatShortDate } from '@/lib/domain/calendar';
 import { formatPeso } from '@/lib/domain/money';
@@ -37,10 +36,10 @@ export function WalletCard({ walletName, balance, safeSpend }: { walletName: str
         </button>
       </form>
       <div className="mt-auto pt-3">
-        <Badge tone="warning" className="whitespace-normal">
+        <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-400">
           Daily Safe Spend Until Next Payday ({paydayLabel}):{' '}
           <span className="font-mono tabular-nums">{formatPeso(safeSpend.dailySafeSpend)}/day</span>
-        </Badge>
+        </p>
         <p className="mt-1.5 text-[11px] text-slate-500">
           {safeSpend.daysUntilPayday} day(s) left
           {safeSpend.obligationsBeforePayday > 0 && ` • ${formatPeso(safeSpend.obligationsBeforePayday)} due before payday reserved`}

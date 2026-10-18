@@ -56,6 +56,13 @@ const SCHEMA = `
     amount      REAL NOT NULL,
     date_logged TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS agent_messages (
+    id          INTEGER PRIMARY KEY,
+    thread_date TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS agent_messages_thread ON agent_messages (thread_date, id);
 `;
 
 const TABLES = ['settings', 'income_rules', 'debt_schedules', 'credit_cards', 'quick_expenses'] as const;
@@ -215,6 +222,46 @@ export function setWalletBalance(balance: number): void {
   connection().prepare("UPDATE settings SET value = ROUND(?, 2) WHERE key = 'wallet_balance'").run(balance);
 }
 
+export interface IncomeInput {
+  name: string;
+  dayOfMonth: number;
+  grossAmount: number;
+  fixedDeductions: number;
+  isPayroll: boolean;
+  absenceRate: number;
+}
+
+function incomeParams(input: IncomeInput) {
+  return {
+    name: input.name,
+    day_of_month: input.dayOfMonth,
+    gross_amount: input.grossAmount,
+    fixed_deductions: input.fixedDeductions,
+    is_payroll: input.isPayroll ? 1 : 0,
+    absence_rate: input.absenceRate,
+  };
+}
+
+export function insertIncome(input: IncomeInput): number {
+  const result = connection()
+    .prepare(
+      `INSERT INTO income_rules (name, day_of_month, gross_amount, fixed_deductions, is_payroll, absence_rate)
+       VALUES (@name, @day_of_month, @gross_amount, @fixed_deductions, @is_payroll, @absence_rate)`,
+    )
+    .run(incomeParams(input));
+  return Number(result.lastInsertRowid);
+}
+
+export function updateIncome(id: number, input: IncomeInput): void {
+  connection()
+    .prepare(
+      `UPDATE income_rules SET name = @name, day_of_month = @day_of_month, gross_amount = @gross_amount,
+         fixed_deductions = @fixed_deductions, is_payroll = @is_payroll, absence_rate = @absence_rate
+       WHERE id = @id`,
+    )
+    .run({ ...incomeParams(input), id });
+}
+
 export function setAbsences(incomeId: number, period: 'current' | 'next', absences: number): void {
   const column = period === 'current' ? 'current_absences' : 'next_month_absences';
   connection().prepare(`UPDATE income_rules SET ${column} = ? WHERE id = ?`).run(absences, incomeId);
@@ -259,13 +306,14 @@ function debtParams(input: DebtInput) {
   };
 }
 
-export function insertDebt(input: DebtInput): void {
-  connection()
+export function insertDebt(input: DebtInput): number {
+  const result = connection()
     .prepare(
       `INSERT INTO debt_schedules (name, lender, due_day, monthly_amount, total_installments, paid_installments, paid_this_month, notes)
        VALUES (@name, @lender, @due_day, @monthly_amount, @total_installments, @paid_installments, 0, @notes)`,
     )
     .run(debtParams(input));
+  return Number(result.lastInsertRowid);
 }
 
 export function updateDebt(id: number, input: DebtInput): void {
@@ -329,22 +377,24 @@ export function undoCardSettlement(id: number, walletDelta: number): void {
   })();
 }
 
-export function addQuickExpense(description: string, amount: number, dateLogged: IsoDate): void {
+export function addQuickExpense(description: string, amount: number, dateLogged: IsoDate): number {
   const db = connection();
-  db.transaction(() => {
-    db.prepare('INSERT INTO quick_expenses (description, amount, date_logged) VALUES (?, ?, ?)').run(description, amount, dateLogged);
+  return db.transaction(() => {
+    const result = db.prepare('INSERT INTO quick_expenses (description, amount, date_logged) VALUES (?, ?, ?)').run(description, amount, dateLogged);
     adjustWalletWith(db, -amount);
+    return Number(result.lastInsertRowid);
   })();
 }
 
-/** Removing a logged expense refunds it to the wallet. */
-export function deleteQuickExpense(id: number): void {
+/** Removing a logged expense refunds it to the wallet. Returns the refunded expense. */
+export function deleteQuickExpense(id: number): QuickExpense | null {
   const db = connection();
-  db.transaction(() => {
-    const row = db.prepare('SELECT amount FROM quick_expenses WHERE id = ?').get(id) as { amount: number } | undefined;
-    if (!row) return;
+  return db.transaction(() => {
+    const row = db.prepare('SELECT * FROM quick_expenses WHERE id = ?').get(id) as Row | undefined;
+    if (!row) return null;
     db.prepare('DELETE FROM quick_expenses WHERE id = ?').run(id);
-    adjustWalletWith(db, row.amount);
+    adjustWalletWith(db, num(row.amount));
+    return toQuickExpense(row);
   })();
 }
 
@@ -361,6 +411,29 @@ export function startNewMonthCycle(): void {
     db.prepare('UPDATE credit_cards SET paid_this_month = 0').run();
     db.prepare("UPDATE settings SET value = ? WHERE key = 'cycle_month'").run(yearMonthKey(next));
     db.prepare("UPDATE settings SET value = ? WHERE key = 'current_month_label'").run(formatMonthLabel(next));
+  })();
+}
+
+/* ──────────────────────────── agent transcript ─────────────────────────── */
+
+export interface StoredAgentMessage {
+  role: 'user' | 'assistant';
+  /** JSON-encoded API content blocks, stored verbatim so history stays append-only. */
+  content: unknown;
+}
+
+export function getAgentThread(threadDate: IsoDate): StoredAgentMessage[] {
+  const rows = connection()
+    .prepare('SELECT role, content FROM agent_messages WHERE thread_date = ? ORDER BY id')
+    .all(threadDate) as Array<{ role: 'user' | 'assistant'; content: string }>;
+  return rows.map((row) => ({ role: row.role, content: JSON.parse(row.content) }));
+}
+
+export function appendAgentMessages(threadDate: IsoDate, messages: StoredAgentMessage[]): void {
+  const db = connection();
+  const insert = db.prepare('INSERT INTO agent_messages (thread_date, role, content) VALUES (?, ?, ?)');
+  db.transaction(() => {
+    for (const message of messages) insert.run(threadDate, message.role, JSON.stringify(message.content));
   })();
 }
 

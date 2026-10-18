@@ -9,6 +9,12 @@
   body {
     @apply bg-slate-950 text-slate-200 antialiased;
   }
+  /* Room for the agent sidebar on wide screens (see AgentDock). */
+  @media (min-width: 1280px) {
+    body[data-agent-dock='open'] > main {
+      margin-right: 400px;
+    }
+  }
 }
 
 @layer components {
